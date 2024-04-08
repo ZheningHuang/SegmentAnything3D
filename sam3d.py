@@ -14,13 +14,215 @@ import multiprocessing as mp
 import pointops
 import random
 import argparse
-
+import time
 from segment_anything import build_sam, SamAutomaticMaskGenerator
 from concurrent.futures import ProcessPoolExecutor
 from itertools import repeat
 from PIL import Image
 from os.path import join
 from util import *
+
+import pyviz3d.visualizer as viz
+
+
+def plot_pcd_group_info_viz(pcd_dict, scene_name, save_dir):
+    v = viz.Visualizer()
+    coord = pcd_dict["coord"]
+    color = pcd_dict["color"]
+    group = pcd_dict["group"]
+    color_coded = color.copy() * 0
+    v.add_points("raw_pc", coord, color, point_size=30, visible=True)
+    seg_idx = np.unique(group)
+    for idx_mask in seg_idx:
+        if idx_mask == -1:
+            continue
+        mask = (group==idx_mask).squeeze()          
+        random_color = lambda: random.randint(0, 255)
+        color_coded[mask,:] = torch.tensor([random_color(), random_color(), random_color()])
+    v.add_points("seg_pc", coord, color_coded, point_size=30, visible=True)
+    v.save(f'{save_dir}/viz/{scene_name}')
+
+
+class G_Merging(object):
+
+    """
+    cuda acclerated merge two point cloud segmentation from different projection
+    Author: Zhening Huang (zh340@cam.ac.uk)
+    """
+
+    def __init__(self, merge_grid=0.05, threshold=0.5):
+        self.th = threshold
+        self.merge_grid = merge_grid
+
+    def __call__(self, pcd_1, pcd_2):
+        pcd_1, pcd_2 = self.remove_unassigned(pcd_1), self.remove_unassigned(pcd_2)
+        if pcd_1["coord"].shape[0] == 0 and pcd_2["coord"].shape[0] != 0:
+            return pcd_2
+        elif pcd_2["coord"].shape[0] == 0 and pcd_1["coord"].shape[0] != 0:
+            return pcd_1
+        elif pcd_1["coord"].shape[0] == 0 and pcd_2["coord"].shape[0] == 0:
+            return None
+        joint_pcd, mask_bin_1, mask_bin_2, group_1_id, group_2_id = self.pcd_concate(pcd_1, pcd_2)
+        joint_pcd_cache = joint_pcd.copy()
+        pcd_1_mask_reduced, pcd_2_mask_reduced = self.grid_downsample(joint_pcd, mask_bin_1, mask_bin_2)
+        overlap_matrix = self.calculate_group_overlap(pcd_1_mask_reduced.cuda(), pcd_2_mask_reduced.cuda())
+        pcd_merged = self.update_group(joint_pcd_cache, overlap_matrix, group_1_id, group_2_id)
+        return pcd_merged
+
+    def update_group(self, joint_pcd, overlap_matrix, group_1_id, group_2_id):
+        # update group_1
+        update_group_1 = torch.max(torch.from_numpy(overlap_matrix), dim=1)
+        group_1_id_old = group_1_id.clone()
+        group_1_id[update_group_1[0] > self.th] = group_2_id[
+            update_group_1[1][update_group_1[0] > self.th]
+        ]
+        mapping_1 = dict(zip(group_1_id_old.cpu().numpy(), group_1_id.cpu().numpy()))
+        for key, value in mapping_1.items():
+            joint_pcd["group"][joint_pcd["group"] == key] = value
+
+        # update group_2
+        update_group_2 = torch.max(torch.from_numpy(overlap_matrix), dim=0)
+        group_2_id_old = group_2_id.clone()
+        group_2_id[update_group_2[0] > self.th] = group_1_id[
+            update_group_2[1][update_group_2[0] > self.th]
+        ]
+        mapping_2 = dict(zip(group_2_id_old.cpu().numpy(), group_2_id.cpu().numpy()))
+        for key, value in mapping_2.items():
+            joint_pcd["group"][joint_pcd["group"] == key] = value
+
+        return joint_pcd
+
+    def pcd_concate(self, pcd_1, pcd_2):
+        # rename pcd
+        pcd_1, pcd_2 = self.rename_group(pcd_1, pcd_2)
+        # concate group
+        joint_pcd_group = np.concatenate((pcd_1["group"], pcd_2["group"]), axis=0)
+        joint_pcd_coord = np.concatenate((pcd_1["coord"], pcd_2["coord"]), axis=0)
+        joint_pcd_color = np.concatenate((pcd_1["color"], pcd_2["color"]), axis=0)
+        joint_pcd = dict(
+            coord=joint_pcd_coord, color=joint_pcd_color, group=joint_pcd_group
+        )
+        # get binary mask for groups in pcd_1 and pcd_2
+        original_mask, group_id = self.group_to_mask(joint_pcd["group"])
+        mask_bin_1_sparse = original_mask[:, group_id <= pcd_1["group"].max()].to_sparse()
+        mask_bin_2_sparse = original_mask[:, group_id > pcd_1["group"].max()].to_sparse()
+        group_id_1 = group_id[group_id <= pcd_1["group"].max()]
+        group_id_2 = group_id[group_id > pcd_1["group"].max()]
+        return joint_pcd, mask_bin_1_sparse, mask_bin_2_sparse, group_id_1, group_id_2
+
+    def group_to_mask(self, group):
+        orignal_mask_flat = torch.from_numpy(group).cuda().view(-1, 1)
+        unique_groups = torch.unique(orignal_mask_flat)
+        unique_groups = unique_groups[unique_groups != -1]
+        original_mask = (orignal_mask_flat == unique_groups.view(1, -1)).float()
+        return original_mask, unique_groups
+
+    def rename_group(self, pcd_1, pcd_2):
+        group_1 = pcd_1["group"]
+        group_2 = pcd_2["group"]
+        group_2 += group_1.max() + 1
+        pcd_2["group"] = group_2
+        return pcd_1, pcd_2
+
+    def grid_downsample(self, joint_pcd, mask_bin_1, mask_bin_2):
+        joint_pcd = self.downsample(joint_pcd)
+        point_transition_matrix = self.voxel_transtion(joint_pcd)
+        mask_bin_1_reduced = (
+            torch.sparse.mm(point_transition_matrix, mask_bin_1).to_dense().cpu()
+        )
+        mask_bin_2_reduced = (
+            torch.sparse.mm(point_transition_matrix, mask_bin_2).to_dense().cpu()
+        )
+        return mask_bin_1_reduced, mask_bin_2_reduced
+
+    def voxel_transtion(self, joint_pcd):
+        '''
+        Create a sparse matrix for transition between original point and downsampled voxels.
+        '''
+        indices = torch.from_numpy(joint_pcd["inverse"]).cuda()
+        column_idx = torch.arange(0, indices.shape[0]).cuda()
+        indices_sparse_group = torch.vstack([column_idx, indices.squeeze()]).cuda()
+        n_points = joint_pcd["coord"].shape[0]
+        N_points = joint_pcd["inverse"].shape[0]
+        point_transition_matrix = torch.sparse.FloatTensor(
+            indices=indices_sparse_group,
+            values=torch.ones(N_points).cuda(),
+            size=(N_points, n_points),
+        ).transpose(0, 1)
+        return point_transition_matrix
+
+    def downsample(self, data_dict):
+        discrete_coord = np.floor(
+            data_dict["coord"] / np.array(self.merge_grid)
+        ).astype(np.int32)
+        discrete_coord -= discrete_coord.min(0)
+        key = self.fnv_hash_vec(discrete_coord)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+        idx_select = (
+            np.cumsum(np.insert(count, 0, 0)[0:-1])
+            + np.random.randint(0, count.max(), count.size) % count
+        )
+        idx_unique = idx_sort[idx_select]
+        data_dict["coord"] = data_dict["coord"][idx_unique]
+        data_dict["color"] = data_dict["color"][idx_unique]
+        data_dict["group"] = data_dict["group"][idx_unique]
+        data_dict["inverse"] = np.zeros_like(inverse)
+        data_dict["inverse"][idx_sort] = inverse
+        return data_dict
+
+    @staticmethod
+    def fnv_hash_vec(arr):
+        """
+        FNV64-1A
+        """
+        assert arr.ndim == 2
+        # Floor first for negative coordinates
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * np.ones(
+            arr.shape[0], dtype=np.uint64
+        )
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
+
+    def calculate_group_overlap(self, mask_list_1, mask_list_2):
+        """
+        Calculate the IoU matrix between two lists of masks using PyTorch.
+
+        Parameters:
+        - mask_list_1: PyTorch tensor with shape (1000, n)
+        - mask_list_2: PyTorch tensor with shape (1000, m)
+        Returns:
+        - iou_matrix: Matrix of IoU values with shape (n, m)
+        #"""
+
+        mask_list_1_t = mask_list_1.t()
+
+        # Calculate intersection and union
+        intersection = torch.mm(mask_list_1_t, mask_list_2)
+        overlap_1 = (
+            mask_list_1_t.sum(dim=1, keepdim=True)
+            + mask_list_2.sum(dim=0, keepdim=True) * 0
+        )
+        overlap_2 = mask_list_1_t.sum(dim=1, keepdim=True) * 0 + mask_list_2.sum(
+            dim=0, keepdim=True
+        )
+        union = torch.min(overlap_1, overlap_2)
+        iou_matrix = intersection / union
+        return iou_matrix.cpu().numpy()
+
+    def remove_unassigned(self, pcd):
+        mask = pcd["group"] != -1
+        pcd["coord"] = pcd["coord"][mask]
+        pcd["color"] = pcd["color"][mask]
+        pcd["group"] = pcd["group"][mask]
+        return pcd
+
+
 
 
 def pcd_ensemble(org_path, new_path, data_path, vis_path):
@@ -49,7 +251,7 @@ def get_sam(image, mask_generator):
 
 
 def get_pcd(scene_name, color_name, rgb_path, mask_generator, save_2dmask_path):
-    intrinsic_path = join(rgb_path, scene_name, 'intrinsics', 'intrinsic_depth.txt')
+    intrinsic_path = join(rgb_path, scene_name, 'intrinsic', 'intrinsic_depth.txt')
     depth_intrinsic = np.loadtxt(intrinsic_path)
 
     pose = join(rgb_path, scene_name, 'pose', color_name[0:-4] + '.txt')
@@ -199,6 +401,17 @@ def cal_2_scenes(pcd_list, index, voxel_size, voxelize, th=50):
     pcd_dict = voxelize(pcd_dict)
     return pcd_dict
 
+def cal_2_scenes_speedup(pcd_list, index, voxel_size, voxelize):
+    if len(index) == 1:
+        return(pcd_list[index[0]])
+    input_dict_0 = pcd_list[index[0]]
+    input_dict_1 = pcd_list[index[1]]
+    group_merge = G_Merging(merge_grid=voxel_size * 1.5, threshold=0.35)
+    pcd_dict = group_merge(input_dict_0, input_dict_1)
+    if pcd_dict is None:
+        return None
+    pcd_dict = voxelize(pcd_dict)
+    return pcd_dict
 
 def seg_pcd(scene_name, rgb_path, data_path, save_path, mask_generator, voxel_size, voxelize, th, train_scenes, val_scenes, save_2dmask_path):
     print(scene_name, flush=True)
@@ -219,13 +432,20 @@ def seg_pcd(scene_name, rgb_path, data_path, save_path, mask_generator, voxel_si
         new_pcd_list = []
         for indice in pairwise_indices(len(pcd_list)):
             # print(indice)
-            pcd_frame = cal_2_scenes(pcd_list, indice, voxel_size=voxel_size, voxelize=voxelize)
+            # pcd_frame = cal_2_scenes(pcd_list, indice, voxel_size=voxel_size, voxelize=voxelize)
+            pcd_frame = cal_2_scenes_speedup(pcd_list, indice, voxel_size=voxel_size, voxelize=voxelize)
             if pcd_frame is not None:
                 new_pcd_list.append(pcd_frame)
         pcd_list = new_pcd_list
     seg_dict = pcd_list[0]
     seg_dict["group"] = num_to_natural(remove_small_group(seg_dict["group"], th))
 
+    plot_pcd_group_info_viz(seg_dict, scene_name, "viz")
+
+    torch.cuda.synchronize()
+    finished_time = time.time()
+    print(f"Time of {scene_name}: {finished_time - time_start}", flush=True)
+    
     if scene_name in train_scenes:
         scene_path = join(data_path, "train", scene_name + ".pth")
     elif scene_name in val_scenes:
